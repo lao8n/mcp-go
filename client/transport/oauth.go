@@ -329,11 +329,12 @@ func (e OAuthError) Error() string {
 	return fmt.Sprintf("OAuth error: %s", e.ErrorCode)
 }
 
-// OAuthProtectedResource represents the response from /.well-known/oauth-protected-resource
-type OAuthProtectedResource struct {
-	AuthorizationServers []string `json:"authorization_servers"`
-	Resource             string   `json:"resource"`
+// OAuthProtectedResourceMetadata represents the RFC 9728 resource metadata
+type OAuthProtectedResourceMetadata struct {
 	ResourceName         string   `json:"resource_name,omitempty"`
+	Resource             string   `json:"resource,omitempty"`
+	AuthorizationServers []string `json:"authorization_servers"`
+	ScopesSupported      []string `json:"scopes_supported"`
 }
 
 // parseAuthHeaderParams parses a WWW-Authenticate header into a map
@@ -375,30 +376,26 @@ func (h *OAuthHandler) getServerMetadata(ctx context.Context) (*AuthServerMetada
 			return
 		}
 
-		// 2. Fetch resource metadata from discovered URL
+		// 2. Fetch and parse resource metadata from discovered URL
 		log.Printf("[DEBUG] getServerMetadata: fetching resource metadata from: %s", resourceMetadataURL)
-		h.fetchMetadataFromURL(ctx, resourceMetadataURL)
-		if h.serverMetadata == nil {
-			log.Printf("[DEBUG] getServerMetadata: failed to fetch resource metadata from discovered URL")
-			h.metadataFetchErr = fmt.Errorf("failed to fetch resource metadata from discovered URL")
+		resourceMetadata, err := h.fetchResourceMetadata(ctx, resourceMetadataURL)
+		if err != nil {
+			log.Printf("[DEBUG] getServerMetadata: failed to fetch resource metadata: %v", err)
+			h.metadataFetchErr = fmt.Errorf("failed to fetch resource metadata: %w", err)
 			return
 		}
 
-		// 3. RFC 9728: Use authorization_servers and scopes_supported if present
-		var protectedResource struct {
-			AuthorizationServers []string `json:"authorization_servers"`
-			ScopesSupported      []string `json:"scopes_supported"`
-		}
-		b, _ := json.Marshal(h.serverMetadata)
-		_ = json.Unmarshal(b, &protectedResource)
-
-		if len(protectedResource.ScopesSupported) > 0 {
-			log.Printf("[DEBUG] getServerMetadata: scopes_supported from resource metadata: %v", protectedResource.ScopesSupported)
-			h.serverMetadata.ScopesSupported = protectedResource.ScopesSupported
+		if len(resourceMetadata.ScopesSupported) > 0 {
+			log.Printf("[DEBUG] getServerMetadata: scopes_supported from resource metadata: %v", resourceMetadata.ScopesSupported)
+			// Save to serverMetadata for downstream use
+			if h.serverMetadata == nil {
+				h.serverMetadata = &AuthServerMetadata{}
+			}
+			h.serverMetadata.ScopesSupported = resourceMetadata.ScopesSupported
 		}
 
-		if len(protectedResource.AuthorizationServers) > 0 {
-			authServerURL := protectedResource.AuthorizationServers[0]
+		if len(resourceMetadata.AuthorizationServers) > 0 {
+			authServerURL := resourceMetadata.AuthorizationServers[0]
 			log.Printf("[DEBUG] getServerMetadata: using authorization server from resource metadata: %s", authServerURL)
 
 			// Try OpenID Connect discovery first
@@ -429,7 +426,7 @@ func (h *OAuthHandler) getServerMetadata(ctx context.Context) (*AuthServerMetada
 		}
 
 		// 4. If no authorization_servers, fallback to legacy fields (for non-RFC9728 servers)
-		if h.serverMetadata.AuthorizationEndpoint == "" {
+		if h.serverMetadata == nil || h.serverMetadata.AuthorizationEndpoint == "" {
 			log.Printf("[DEBUG] getServerMetadata: no authorization endpoint in resource metadata and no authorization_servers present")
 			h.metadataFetchErr = fmt.Errorf("no authorization endpoint in resource metadata and no authorization_servers present")
 			return
@@ -785,4 +782,38 @@ func (h *OAuthHandler) GetAuthorizationURL(ctx context.Context, state, codeChall
 	}
 
 	return metadata.AuthorizationEndpoint + "?" + params.Encode(), nil
+}
+
+// fetchResourceMetadata fetches and parses OAuth protected resource metadata (RFC 9728)
+func (h *OAuthHandler) fetchResourceMetadata(ctx context.Context, metadataURL string) (*OAuthProtectedResourceMetadata, error) {
+	log.Printf("[DEBUG] fetchResourceMetadata: trying URL: %s", metadataURL)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, metadataURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create resource metadata request: %w", err)
+	}
+
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("MCP-Protocol-Version", "2025-03-26")
+
+	resp, err := h.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to send resource metadata request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	log.Printf("[DEBUG] fetchResourceMetadata: response status: %d", resp.StatusCode)
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("resource metadata request failed with status %d: %s", resp.StatusCode, string(body))
+	}
+
+	var metadata OAuthProtectedResourceMetadata
+	if err := json.NewDecoder(resp.Body).Decode(&metadata); err != nil {
+		return nil, fmt.Errorf("failed to decode resource metadata response: %w", err)
+	}
+
+	log.Printf("[DEBUG] fetchResourceMetadata: successfully parsed resource metadata - auth_servers: %v, scopes: %v", metadata.AuthorizationServers, metadata.ScopesSupported)
+	return &metadata, nil
 }
