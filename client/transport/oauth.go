@@ -430,8 +430,8 @@ func (h *OAuthHandler) getServerMetadata(ctx context.Context) (*AuthServerMetada
 
 		// 4. If no authorization_servers, fallback to legacy fields (for non-RFC9728 servers)
 		if h.serverMetadata.AuthorizationEndpoint == "" {
-			log.Printf("[DEBUG] getServerMetadata: no authorization endpoint in resource metadata")
-			h.metadataFetchErr = fmt.Errorf("no authorization endpoint in resource metadata")
+			log.Printf("[DEBUG] getServerMetadata: no authorization endpoint in resource metadata and no authorization_servers present")
+			h.metadataFetchErr = fmt.Errorf("no authorization endpoint in resource metadata and no authorization_servers present")
 			return
 		}
 		log.Printf("[DEBUG] getServerMetadata: using legacy authorization endpoint: %s", h.serverMetadata.AuthorizationEndpoint)
