@@ -32,6 +32,8 @@ type OAuthConfig struct {
 	AuthServerMetadataURL string
 	// PKCEEnabled enables PKCE for the OAuth flow (recommended for public clients)
 	PKCEEnabled bool
+	// MCPResourceEndpoint is the endpoint to probe for resource discovery (default: /mcp/)
+	MCPResourceEndpoint string
 }
 
 // TokenStore is an interface for storing and retrieving OAuth tokens
@@ -334,6 +336,20 @@ type OAuthProtectedResource struct {
 	ResourceName         string   `json:"resource_name,omitempty"`
 }
 
+// parseAuthHeaderParams parses a WWW-Authenticate header into a map
+func parseAuthHeaderParams(header string) map[string]string {
+	params := map[string]string{}
+	for _, part := range strings.Split(header, ",") {
+		kv := strings.SplitN(strings.TrimSpace(part), "=", 2)
+		if len(kv) == 2 {
+			key := strings.TrimSpace(kv[0])
+			val := strings.Trim(kv[1], `"`)
+			params[key] = val
+		}
+	}
+	return params
+}
+
 // getServerMetadata fetches the OAuth server metadata
 func (h *OAuthHandler) getServerMetadata(ctx context.Context) (*AuthServerMetadata, error) {
 	h.metadataOnce.Do(func() {
@@ -348,88 +364,40 @@ func (h *OAuthHandler) getServerMetadata(ctx context.Context) (*AuthServerMetada
 
 		log.Printf("[DEBUG] getServerMetadata: no explicit metadata URL, attempting discovery")
 
-		// Try to discover the authorization server via OAuth Protected Resource
-		// as per RFC 9728 (https://datatracker.ietf.org/doc/html/rfc9728)
-		baseURL, err := h.extractBaseURL()
+		// 1. Make unauthenticated MCP request to discover resource_metadata (https://datatracker.ietf.org/doc/html/rfc9728)
+		mcpEndpoint := h.baseURL + "/mcp/"
+		if h.config.MCPResourceEndpoint != "" {
+			mcpEndpoint = h.baseURL + h.config.MCPResourceEndpoint
+		}
+		resourceMetadataURL, err := h.discoverResourceMetadataFrom401(ctx, mcpEndpoint)
 		if err != nil {
-			log.Printf("[DEBUG] getServerMetadata: failed to extract base URL: %v", err)
-			h.metadataFetchErr = fmt.Errorf("failed to extract base URL: %w", err)
+			log.Printf("[DEBUG] getServerMetadata: failed to discover resource_metadata from 401: %v", err)
+			h.metadataFetchErr = fmt.Errorf("failed to discover resource_metadata from 401: %w", err)
 			return
 		}
 
-		log.Printf("[DEBUG] getServerMetadata: extracted base URL: %s", baseURL)
-
-		// Try to fetch the OAuth Protected Resource metadata
-		protectedResourceURL := baseURL + "/.well-known/oauth-protected-resource"
-		log.Printf("[DEBUG] getServerMetadata: trying protected resource URL: %s", protectedResourceURL)
-
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, protectedResourceURL, nil)
-		if err != nil {
-			log.Printf("[DEBUG] getServerMetadata: failed to create protected resource request: %v", err)
-			h.metadataFetchErr = fmt.Errorf("failed to create protected resource request: %w", err)
+		// 2. Fetch resource metadata from discovered URL
+		log.Printf("[DEBUG] getServerMetadata: fetching resource metadata from: %s", resourceMetadataURL)
+		h.fetchMetadataFromURL(ctx, resourceMetadataURL)
+		if h.serverMetadata == nil {
+			log.Printf("[DEBUG] getServerMetadata: failed to fetch resource metadata from discovered URL")
+			h.metadataFetchErr = fmt.Errorf("failed to fetch resource metadata from discovered URL")
 			return
 		}
 
-		req.Header.Set("Accept", "application/json")
-		req.Header.Set("MCP-Protocol-Version", "2025-03-26")
-
-		resp, err := h.httpClient.Do(req)
-		if err != nil {
-			log.Printf("[DEBUG] getServerMetadata: failed to send protected resource request: %v", err)
-			h.metadataFetchErr = fmt.Errorf("failed to send protected resource request: %w", err)
-			return
-		}
-		defer resp.Body.Close()
-
-		log.Printf("[DEBUG] getServerMetadata: protected resource response status: %d", resp.StatusCode)
-
-		// If we can't get the protected resource metadata, fall back to default endpoints
-		if resp.StatusCode != http.StatusOK {
-			log.Printf("[DEBUG] getServerMetadata: protected resource not available, falling back to default endpoints")
-			metadata, err := h.getDefaultEndpoints(baseURL)
-			if err != nil {
-				log.Printf("[DEBUG] getServerMetadata: failed to get default endpoints: %v", err)
-				h.metadataFetchErr = fmt.Errorf("failed to get default endpoints: %w", err)
-				return
-			}
-			h.serverMetadata = metadata
-			log.Printf("[DEBUG] getServerMetadata: using default endpoints - auth: %s, token: %s",
-				metadata.AuthorizationEndpoint, metadata.TokenEndpoint)
+		// 3. Continue as before: extract auth server, try OIDC/OAuth discovery, fallback
+		protectedResource := h.serverMetadata
+		if len(protectedResource.AuthorizationEndpoint) == 0 {
+			log.Printf("[DEBUG] getServerMetadata: no authorization endpoint in resource metadata")
+			h.metadataFetchErr = fmt.Errorf("no authorization endpoint in resource metadata")
 			return
 		}
 
-		// Parse the protected resource metadata
-		var protectedResource OAuthProtectedResource
-		if err := json.NewDecoder(resp.Body).Decode(&protectedResource); err != nil {
-			log.Printf("[DEBUG] getServerMetadata: failed to decode protected resource response: %v", err)
-			h.metadataFetchErr = fmt.Errorf("failed to decode protected resource response: %w", err)
-			return
-		}
-
-		log.Printf("[DEBUG] getServerMetadata: protected resource - resource: %s, auth servers: %v",
-			protectedResource.Resource, protectedResource.AuthorizationServers)
-
-		// If no authorization servers are specified, fall back to default endpoints
-		if len(protectedResource.AuthorizationServers) == 0 {
-			log.Printf("[DEBUG] getServerMetadata: no authorization servers specified, falling back to default endpoints")
-			metadata, err := h.getDefaultEndpoints(baseURL)
-			if err != nil {
-				log.Printf("[DEBUG] getServerMetadata: failed to get default endpoints: %v", err)
-				h.metadataFetchErr = fmt.Errorf("failed to get default endpoints: %w", err)
-				return
-			}
-			h.serverMetadata = metadata
-			log.Printf("[DEBUG] getServerMetadata: using default endpoints - auth: %s, token: %s",
-				metadata.AuthorizationEndpoint, metadata.TokenEndpoint)
-			return
-		}
-
-		// Use the first authorization server
-		authServerURL := protectedResource.AuthorizationServers[0]
+		// Use the first authorization server (if present)
+		authServerURL := protectedResource.Issuer // or parse from AuthorizationEndpoint if needed
 		log.Printf("[DEBUG] getServerMetadata: using authorization server: %s", authServerURL)
 
 		// Try OpenID Connect discovery first
-		log.Printf("[DEBUG] getServerMetadata: trying OpenID Connect discovery")
 		h.fetchMetadataFromURL(ctx, authServerURL+"/.well-known/openid-configuration")
 		if h.serverMetadata != nil {
 			log.Printf("[DEBUG] getServerMetadata: OpenID Connect discovery successful")
@@ -437,7 +405,6 @@ func (h *OAuthHandler) getServerMetadata(ctx context.Context) (*AuthServerMetada
 		}
 
 		// If OpenID Connect discovery fails, try OAuth Authorization Server Metadata
-		log.Printf("[DEBUG] getServerMetadata: OpenID Connect discovery failed, trying OAuth Authorization Server Metadata")
 		h.fetchMetadataFromURL(ctx, authServerURL+"/.well-known/oauth-authorization-server")
 		if h.serverMetadata != nil {
 			log.Printf("[DEBUG] getServerMetadata: OAuth Authorization Server Metadata discovery successful")
@@ -445,7 +412,6 @@ func (h *OAuthHandler) getServerMetadata(ctx context.Context) (*AuthServerMetada
 		}
 
 		// If both discovery methods fail, use default endpoints based on the authorization server URL
-		log.Printf("[DEBUG] getServerMetadata: both discovery methods failed, using default endpoints")
 		metadata, err := h.getDefaultEndpoints(authServerURL)
 		if err != nil {
 			log.Printf("[DEBUG] getServerMetadata: failed to get default endpoints: %v", err)
@@ -464,6 +430,41 @@ func (h *OAuthHandler) getServerMetadata(ctx context.Context) (*AuthServerMetada
 
 	log.Printf("[DEBUG] getServerMetadata: returning metadata successfully")
 	return h.serverMetadata, nil
+}
+
+// discoverResourceMetadataFrom401 makes an unauthenticated MCP request and extracts resource_metadata from the WWW-Authenticate header on 401
+func (h *OAuthHandler) discoverResourceMetadataFrom401(ctx context.Context, mcpEndpoint string) (string, error) {
+	log.Printf("[DEBUG] discoverResourceMetadataFrom401: making unauthenticated request to %s", mcpEndpoint)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, mcpEndpoint, nil)
+	if err != nil {
+		return "", fmt.Errorf("failed to create MCP request: %w", err)
+	}
+
+	resp, err := h.httpClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("failed to send MCP request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusUnauthorized {
+		return "", fmt.Errorf("expected 401 Unauthorized, got %d", resp.StatusCode)
+	}
+
+	// Parse WWW-Authenticate header for resource_metadata
+	hdr := resp.Header.Get("WWW-Authenticate")
+	if hdr == "" {
+		return "", fmt.Errorf("no WWW-Authenticate header in 401 response")
+	}
+	log.Printf("[DEBUG] discoverResourceMetadataFrom401: WWW-Authenticate header: %s", hdr)
+
+	params := parseAuthHeaderParams(hdr)
+	resourceMetadata, ok := params["resource_metadata"]
+	if !ok || resourceMetadata == "" {
+		return "", fmt.Errorf("no resource_metadata in WWW-Authenticate header")
+	}
+	log.Printf("[DEBUG] discoverResourceMetadataFrom401: found resource_metadata: %s", resourceMetadata)
+	return resourceMetadata, nil
 }
 
 // fetchMetadataFromURL fetches and parses OAuth server metadata from a URL
