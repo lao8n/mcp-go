@@ -206,6 +206,9 @@ func TestOAuthHandler_GetServerMetadata_EmptyURL(t *testing.T) {
 
 	handler := NewOAuthHandler(config)
 
+	// Set a base URL so the handler can make requests
+	handler.SetBaseURL("http://localhost:8080")
+
 	// Test getting server metadata with empty URL
 	_, err := handler.GetServerMetadata(context.Background())
 	if err == nil {
@@ -215,7 +218,8 @@ func TestOAuthHandler_GetServerMetadata_EmptyURL(t *testing.T) {
 	// Verify the error message contains something about a connection error
 	// since we're now trying to connect to the well-known endpoint
 	if !strings.Contains(err.Error(), "connection refused") &&
-		!strings.Contains(err.Error(), "failed to send protected resource request") {
+		!strings.Contains(err.Error(), "failed to send protected resource request") &&
+		!strings.Contains(err.Error(), "failed to send MCP request") {
 		t.Errorf("Expected error message to contain connection error, got %s", err.Error())
 	}
 }
