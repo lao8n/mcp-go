@@ -156,15 +156,15 @@ func (h *OAuthHandler) getValidToken(ctx context.Context) (*Token, error) {
 
 	token, err := h.config.TokenStore.GetToken()
 	if err != nil {
-		return nil, err
+		return nil, ErrOAuthAuthorizationRequired
 	}
 
-	if err == nil && !token.IsExpired() && token.AccessToken != "" {
+	if !token.IsExpired() && token.AccessToken != "" {
 		return token, nil
 	}
 
 	// If we have a refresh token, try to use it
-	if err == nil && token.RefreshToken != "" {
+	if token.RefreshToken != "" {
 		newToken, err := h.refreshToken(ctx, token.RefreshToken)
 		if err == nil {
 			return newToken, nil
@@ -426,7 +426,7 @@ func (h *OAuthHandler) fetchMetadataFromURL(ctx context.Context, metadataURL str
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, metadataURL, nil)
 	if err != nil {
-		h.metadataFetchErr = fmt.Errorf("failed to create metadata request: %w", err)
+		// Don't set metadataFetchErr here - let the caller handle it
 		return
 	}
 
@@ -435,19 +435,19 @@ func (h *OAuthHandler) fetchMetadataFromURL(ctx context.Context, metadataURL str
 
 	resp, err := h.httpClient.Do(req)
 	if err != nil {
-		h.metadataFetchErr = fmt.Errorf("failed to send metadata request: %w", err)
+		// Don't set metadataFetchErr here - let the caller handle it
 		return
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		h.metadataFetchErr = fmt.Errorf("metadata discovery failed with status %d", resp.StatusCode)
+		// Don't set metadataFetchErr here - let the caller handle it
 		return
 	}
 
 	var metadata AuthServerMetadata
 	if err := json.NewDecoder(resp.Body).Decode(&metadata); err != nil {
-		h.metadataFetchErr = fmt.Errorf("failed to decode metadata response: %w", err)
+		// Don't set metadataFetchErr here - let the caller handle it
 		return
 	}
 
