@@ -363,7 +363,6 @@ func (h *OAuthHandler) getServerMetadata(ctx context.Context) (*AuthServerMetada
 		}
 
 		log.Printf("[DEBUG] getServerMetadata: no explicit metadata URL, attempting discovery")
-
 		// 1. Make unauthenticated MCP request to discover resource_metadata (https://datatracker.ietf.org/doc/html/rfc9728)
 		mcpEndpoint := h.baseURL + "/mcp/"
 		if h.config.MCPResourceEndpoint != "" {
@@ -385,42 +384,57 @@ func (h *OAuthHandler) getServerMetadata(ctx context.Context) (*AuthServerMetada
 			return
 		}
 
-		// 3. Continue as before: extract auth server, try OIDC/OAuth discovery, fallback
-		protectedResource := h.serverMetadata
-		if len(protectedResource.AuthorizationEndpoint) == 0 {
+		// 3. RFC 9728: Use authorization_servers and scopes_supported if present
+		var protectedResource struct {
+			AuthorizationServers []string `json:"authorization_servers"`
+			ScopesSupported      []string `json:"scopes_supported"`
+		}
+		b, _ := json.Marshal(h.serverMetadata)
+		_ = json.Unmarshal(b, &protectedResource)
+
+		if len(protectedResource.ScopesSupported) > 0 {
+			log.Printf("[DEBUG] getServerMetadata: scopes_supported from resource metadata: %v", protectedResource.ScopesSupported)
+			h.serverMetadata.ScopesSupported = protectedResource.ScopesSupported
+		}
+
+		if len(protectedResource.AuthorizationServers) > 0 {
+			authServerURL := protectedResource.AuthorizationServers[0]
+			log.Printf("[DEBUG] getServerMetadata: using authorization server from resource metadata: %s", authServerURL)
+
+			// Try OpenID Connect discovery first
+			h.fetchMetadataFromURL(ctx, authServerURL+"/.well-known/openid-configuration")
+			if h.serverMetadata != nil && h.serverMetadata.AuthorizationEndpoint != "" {
+				log.Printf("[DEBUG] getServerMetadata: OpenID Connect discovery successful")
+				return
+			}
+
+			// If OpenID Connect discovery fails, try OAuth Authorization Server Metadata
+			h.fetchMetadataFromURL(ctx, authServerURL+"/.well-known/oauth-authorization-server")
+			if h.serverMetadata != nil && h.serverMetadata.AuthorizationEndpoint != "" {
+				log.Printf("[DEBUG] getServerMetadata: OAuth Authorization Server Metadata discovery successful")
+				return
+			}
+
+			// If both discovery methods fail, use default endpoints based on the authorization server URL
+			metadata, err := h.getDefaultEndpoints(authServerURL)
+			if err != nil {
+				log.Printf("[DEBUG] getServerMetadata: failed to get default endpoints: %v", err)
+				h.metadataFetchErr = fmt.Errorf("failed to get default endpoints: %w", err)
+				return
+			}
+			h.serverMetadata = metadata
+			log.Printf("[DEBUG] getServerMetadata: using default endpoints - auth: %s, token: %s",
+				metadata.AuthorizationEndpoint, metadata.TokenEndpoint)
+			return
+		}
+
+		// 4. If no authorization_servers, fallback to legacy fields (for non-RFC9728 servers)
+		if h.serverMetadata.AuthorizationEndpoint == "" {
 			log.Printf("[DEBUG] getServerMetadata: no authorization endpoint in resource metadata")
 			h.metadataFetchErr = fmt.Errorf("no authorization endpoint in resource metadata")
 			return
 		}
-
-		// Use the first authorization server (if present)
-		authServerURL := protectedResource.Issuer // or parse from AuthorizationEndpoint if needed
-		log.Printf("[DEBUG] getServerMetadata: using authorization server: %s", authServerURL)
-
-		// Try OpenID Connect discovery first
-		h.fetchMetadataFromURL(ctx, authServerURL+"/.well-known/openid-configuration")
-		if h.serverMetadata != nil {
-			log.Printf("[DEBUG] getServerMetadata: OpenID Connect discovery successful")
-			return
-		}
-
-		// If OpenID Connect discovery fails, try OAuth Authorization Server Metadata
-		h.fetchMetadataFromURL(ctx, authServerURL+"/.well-known/oauth-authorization-server")
-		if h.serverMetadata != nil {
-			log.Printf("[DEBUG] getServerMetadata: OAuth Authorization Server Metadata discovery successful")
-			return
-		}
-
-		// If both discovery methods fail, use default endpoints based on the authorization server URL
-		metadata, err := h.getDefaultEndpoints(authServerURL)
-		if err != nil {
-			log.Printf("[DEBUG] getServerMetadata: failed to get default endpoints: %v", err)
-			h.metadataFetchErr = fmt.Errorf("failed to get default endpoints: %w", err)
-			return
-		}
-		h.serverMetadata = metadata
-		log.Printf("[DEBUG] getServerMetadata: using default endpoints - auth: %s, token: %s",
-			metadata.AuthorizationEndpoint, metadata.TokenEndpoint)
+		log.Printf("[DEBUG] getServerMetadata: using legacy authorization endpoint: %s", h.serverMetadata.AuthorizationEndpoint)
 	})
 
 	if h.metadataFetchErr != nil {
